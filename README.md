@@ -21,8 +21,6 @@ Changed in :
 - offline\_inference.py
 - testmath.py
 
-Currntly not stable, just update a stable version without swap pipeline
-
 Almost all stable changes begin with "# NOTE(KJ.W)"
 
 IF want to run code, please use special conda env (vllm-cu124)
