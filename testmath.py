@@ -39,17 +39,19 @@ def get_request_output(llm):
         step_outputs = llm.llm_engine.step()
         for output in step_outputs:
             if output.finished:
+                res = output.outputs[0]
                 output_text = output.outputs[0].text
+    # print("[*]Output: ", res)
     end_time = time.time()
     return output_text, end_time - start_time
 
 def math_action_parsing(thought_action, this_request):
     step = this_request.step
-    print("[*]Current step: ", step)
+    # print("[*]Current step: ", step)
     try:
         thought, action = thought_action.strip().split(f"Action {step}: ")
-        print("[*]Thought: ", thought)
-        print("[*]Action: ", action)
+        # print("[*]Thought: ", thought)
+        # print("[*]Action: ", action)
         # parse the action
         if action.startswith("Add"):
             action_type = 1
@@ -75,8 +77,8 @@ def math_action_parsing(thought_action, this_request):
         number_list = [int(x) if x.isdigit() else float(x) for x in number_list]
         this_request.extend_thought(thought)
         this_request.extend_action(action)
-        print("[*]action_type: ", action_type)
-        print("[*]number_list: ", number_list)
+        # print("[*]action_type: ", action_type)
+        # print("[*]number_list: ", number_list)
         return action_type, number_list
     except:
         print("[ERROR]Error: action parsing failed.", "\n\n", thought_action, step, "\n\n")
@@ -137,7 +139,7 @@ if __name__ == "__main__":
 
     llm = LLM(model="meta-llama/Llama-2-7b-chat-hf", enforce_eager=True, tensor_parallel_size=args.nGPU, enable_prefix_caching=args.prefix_cache)
     
-    for i in range(3):
+    for i in range(10):
         question = inputs_and_answer[i][0]
         answer = inputs_and_answer[i][1]
         request_id = str(next(llm.request_counter))    
@@ -154,9 +156,9 @@ if __name__ == "__main__":
         while llm.llm_engine.has_unfinished_requests():
             output, llm_latency = get_request_output(llm)
 
-            print("="*40, i, "="*40)
-            print("[*]Output: ", output)
-            print("="*81)
+            # print("="*40, i, "="*40)
+            # print("[*]Output: ", output)
+            # print("="*81)
 
             action_type, number_list = math_action_parsing(output, this_request)
 

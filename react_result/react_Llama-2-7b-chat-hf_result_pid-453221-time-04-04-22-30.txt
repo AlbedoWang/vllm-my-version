@@ -1,0 +1,5 @@
+id, if_acc, step, latency, label, answer
+0, False, 2, 8.267760276794434, 18.0, None
+1, False, 2, 10.336637735366821, 3.0, None
+2, False, 2, 8.198180437088013, 540.0, None
+n_test:3, Accuracy: 0.000, avg_step:2.000, avg_latency:8.934

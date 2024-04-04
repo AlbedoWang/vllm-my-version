@@ -496,24 +496,28 @@ class LLMEngine:
             prompt_token_ids=prompt_token_ids,
             lora_request=lora_request)
         
+        # print("[*]Add Request with request_id: ", request_id)
+        # print("[*]Prompt: ", prompt)
+        # print("[*]Prompt Token IDs: ", prompt_token_ids)
         
-
         # Create the sequences.
         block_size = self.cache_config.block_size
         seq_id = next(self.seq_counter)
         seq = Sequence(seq_id, prompt, prompt_token_ids, block_size,
                        lora_request)
 
+        # print("[*]Sequence info: ", seq)
         # Defensive copy of SamplingParams, which are used by the sampler,
         # this doesn't deep-copy LogitsProcessor objects
         sampling_params = sampling_params.clone()
 
         # Create the sequence group.
         # print("[*]Create Sequence Group with request_id: ", request_id)
-        print("[DEBUGGER] Current Prompt: ", prompt)
-        print("[DEBUGGER] Current Samp Param: ", sampling_params)
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
                                   arrival_time, lora_request)
+        
+        # print("[*]Sequence Group info: ", seq_group)
+        
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
     
@@ -534,15 +538,18 @@ class LLMEngine:
         update_prompt_token_ids = self.encode_request(request_id=request_id, prompt=prompt)
         seq_group = self.scheduler.get_paused_group(request_id)
         self.scheduler.paused.remove(seq_group)
-        print("[DEBUGGER] Current Prompt: ", prompt)
-        print("[DEBUGGER] New sampling params: ", sampling_params)
-        print("[DEBUGGER] Current seq_group.sampling_params: ", seq_group.sampling_params)
+        # print("[DEBUGGER] Current Prompt: ", prompt)
+        # print("[DEBUGGER] New sampling params: ", sampling_params)
+        # print("[DEBUGGER] Current seq_group.sampling_params: ", seq_group.sampling_params)
         seq_group.sampling_params = sampling_params
         seq_group.update_seq_group_token_ids(
             prompt=prompt, 
             token_ids=update_prompt_token_ids)
+        # print("[*]Prompt Token IDs: ", seq_group.prompt_token_ids)
         self.scheduler.block_manager.extend_block_tables(seq_group)
         seq_group.activate_seq_group()
+        # print("[*]Sequence Info: ", seq_group.get_seqs()[0])
+        # print("[*]Group Info: ", seq_group)
         self.scheduler.running.append(seq_group)
         
         

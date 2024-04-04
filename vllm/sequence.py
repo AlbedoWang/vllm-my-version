@@ -349,6 +349,7 @@ class SequenceGroup:
         for seq in self.get_seqs():
             # print("[*]seq info before: ", seq)
             seq.prompt = prompt
+            seq.output_text = ""
             seq.data.prompt_token_ids = token_ids
             seq.data.output_token_ids = []
             seq.data.cumulative_logprob = 0.0

@@ -150,7 +150,7 @@ class math_request:
 
     def extend_observation(self, result):
         self.prompt += f"Observation {self.step}: The result is {result}\n"
-        print("[*]Extend observation:", f"Observation {self.step}: The result is {result}\n", "len:", len(f"Observation {self.step}: The result is {result}\n"))
+        # print("[*]Extend observation:", f"Observation {self.step}: The result is {result}\n", "len:", len(f"Observation {self.step}: The result is {result}\n"))
         self.step += 1
 
     def finish(self):
