@@ -45,8 +45,11 @@ def get_request_output(llm):
 
 def math_action_parsing(thought_action, this_request):
     step = this_request.step
+    print("[*]Current step: ", step)
     try:
         thought, action = thought_action.strip().split(f"Action {step}: ")
+        print("[*]Thought: ", thought)
+        print("[*]Action: ", action)
         # parse the action
         if action.startswith("Add"):
             action_type = 1
@@ -65,17 +68,18 @@ def math_action_parsing(thought_action, this_request):
             action_type = 5
             offset = 7
         else:
-            # print("Error: action parsing failed.", "\n\n", thought, action, step, "\n\n")
+            print("[No Match]Error: action parsing failed.", "\n\n", thought, action, step, "\n\n")
             return 0, [None]
-
         numbers = action[offset:-1]
         number_list = numbers.split(",")
         number_list = [int(x) if x.isdigit() else float(x) for x in number_list]
         this_request.extend_thought(thought)
         this_request.extend_action(action)
+        print("[*]action_type: ", action_type)
+        print("[*]number_list: ", number_list)
         return action_type, number_list
     except:
-        # print("Error: action parsing failed.", "\n\n", thought_action, step, "\n\n")
+        print("[ERROR]Error: action parsing failed.", "\n\n", thought_action, step, "\n\n")
         return 0, [None]
     
 def calculator(action, number_list):
@@ -97,8 +101,6 @@ def calculator(action, number_list):
     else:
         return None
     
-
-
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["GET_LLAMA_INFO"] = "0"
@@ -135,7 +137,7 @@ if __name__ == "__main__":
 
     llm = LLM(model="meta-llama/Llama-2-7b-chat-hf", enforce_eager=True, tensor_parallel_size=args.nGPU, enable_prefix_caching=args.prefix_cache)
     
-    for i in range(20):
+    for i in range(3):
         question = inputs_and_answer[i][0]
         answer = inputs_and_answer[i][1]
         request_id = str(next(llm.request_counter))    
@@ -144,12 +146,17 @@ if __name__ == "__main__":
 
         sampling_params = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens, stop=[f"\nObservation {this_request.step}:"])
         llm.llm_engine.add_request(this_request.id, this_request.prompt, sampling_params)
+        prompt_token_ids = llm.llm_engine.encode_request(request_id=request_id, prompt=this_request.prompt)
 
         if_acc = False
 
         start_time = time.time()
         while llm.llm_engine.has_unfinished_requests():
             output, llm_latency = get_request_output(llm)
+
+            print("="*40, i, "="*40)
+            print("[*]Output: ", output)
+            print("="*81)
 
             action_type, number_list = math_action_parsing(output, this_request)
 
@@ -159,6 +166,8 @@ if __name__ == "__main__":
                 if abs(number_list[0] - answer) < 1e-3:
                     if_acc = True
                     n_correct += 1
+                # NOTE(KJ.W): Remove the paused sequence group
+                llm.llm_engine.remove_paused_seq_group(this_request.id)
                 print("Finish the request: ID-{}; Answer:{}; Label:{}".format(this_request.id, number_list[0], answer))
             elif action_type == 0 or action_type > 5:
                 n_finished += 1
@@ -166,6 +175,7 @@ if __name__ == "__main__":
                 # print("\n================================================")
                 # print(output)
                 # print("================================================\n")
+                llm.llm_engine.remove_paused_seq_group(this_request.id)
                 print("Request Parsing ERROR ID-{}".format(this_request.id))
             elif this_request.step > args.step_upperbound:
                 n_finished += 1
@@ -173,14 +183,32 @@ if __name__ == "__main__":
                 # print("\n================================================")
                 # print(output)
                 # print("================================================\n")
+                llm.llm_engine.remove_paused_seq_group(this_request.id)
                 print("Request ERROR Step upper bound ID-{}".format(this_request.id))
             else: # call the calculator
                 result = calculator(action_type, number_list)
                 this_request.extend_observation(result)
                 sampling_params = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens, stop=[f"\nObservation {this_request.step}:"])
-                llm.llm_engine.add_request(this_request.id, this_request.prompt, sampling_params)
+                # print("================================================\n")
+                # print(f"Add request")
+                # print("================================================\n")
+                # print("[*]Current llm engine schedule:"
+                #     f"\n\t- Running: {len(llm.llm_engine.scheduler.running)}"
+                #     f"\n\t- Paused: {len(llm.llm_engine.scheduler.paused)}")
 
+                # llm.llm_engine.add_request(this_request.id, this_request.prompt, sampling_params)
+                llm.llm_engine.update_paused_request(this_request.id, this_request.prompt, sampling_params)
+                
+                # print("[*]Current llm engine schedule(After update):"
+                #     f"\n\t- Running: {len(llm.llm_engine.scheduler.running)}"
+                #     f"\n\t- Paused: {len(llm.llm_engine.scheduler.paused)}"
+                #     f"\n\t- Waiting: {len(llm.llm_engine.scheduler.waiting)}")
+                # print("================================================\n")
 
+        # print("[*]Current llm engine schedule:"
+        #       f"\n\t- Running: {len(llm.llm_engine.scheduler.running)}"
+        #       f"\n\t- Paused: {len(llm.llm_engine.scheduler.paused)}")
+        
         end_time = time.time()
         request_latency = end_time - start_time
         total_latency += request_latency
@@ -189,12 +217,12 @@ if __name__ == "__main__":
         request_log_list.append((this_request.id, if_acc, this_request.step, request_latency, answer, number_list[0]))
 
 
-    output_file = "react_result/react_{}_result_pid-{}-time-{}.txt".format(model_name, os.getpid(), datetime.now().strftime("%m-%d-%H-%M"))
-    with open(output_file, "w") as f:
+    output_file = "/home/kaijian_wang/vllm-my-version/react_result/react_{}_result_pid-{}-time-{}.txt".format(model_name.split('/')[-1], os.getpid(), datetime.now().strftime("%m-%d-%H-%M"))
+    with open(output_file, "w+") as f:
         f.write("id, if_acc, step, latency, label, answer\n")
         for line in request_log_list:
             f.write(", ".join(str(x) for x in line) + "\n")
 
-        print("n_test:{}, Accuracy:{:.3f}%, avg_step:{:.3f}, avg_latency:{:.3f}".format(n_finished, n_correct/n_finished, total_step/n_finished, total_latency/n_finished))
-        f.write("n_test:{}, Accuracy: {:.3f}%, avg_step:{:.3f}, avg_latency:{:.3f}\n".format(n_finished, n_correct/n_finished, total_step/n_finished, total_latency/n_finished))
+        print("n_test:{}, Accuracy:{:.3f}, avg_step:{:.3f}, avg_latency:{:.3f}".format(n_finished, n_correct/n_finished, total_step/n_finished, total_latency/n_finished))
+        f.write("n_test:{}, Accuracy: {:.3f}, avg_step:{:.3f}, avg_latency:{:.3f}\n".format(n_finished, n_correct/n_finished, total_step/n_finished, total_latency/n_finished))
 

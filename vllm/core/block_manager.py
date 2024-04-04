@@ -182,6 +182,31 @@ class BlockSpaceManager:
             return AllocStatus.OK
         else:
             return AllocStatus.LATER
+    
+    # NOTE(KJ.W): This function is used to extend the block tables for the sequences in the group
+    def extend_block_tables(self, seq_group: SequenceGroup) -> None:
+        # NOTE: Here we assume that all sequences in the group have the same
+        # prompt.
+        seq = seq_group.get_seqs(status=SequenceStatus.FINISHED_PAUSED)[0]
+
+        # Allocate new physical token blocks that will store the prompt tokens.
+        num_prompt_blocks = len(seq.logical_token_blocks)
+
+        block_table: BlockTable = []
+        block_table = self.block_tables[seq.seq_id]
+        for logical_idx in range(num_prompt_blocks - len(block_table)):
+            if (self.block_sliding_window is not None
+                    and logical_idx >= self.block_sliding_window):
+                block = block_table[logical_idx % self.block_sliding_window]
+            else:
+                block = self.gpu_allocator.allocate(
+                    seq.hash_of_block(logical_idx),
+                    seq.num_hashed_tokens_of_block(logical_idx))
+            block_table.append(block)
+
+        # Assign the block table for each sequence.
+        for seq in seq_group.get_seqs(status=SequenceStatus.FINISHED_PAUSED):
+            self.block_tables[seq.seq_id] = block_table.copy()
 
     def allocate(self, seq_group: SequenceGroup) -> None:
         # NOTE: Here we assume that all sequences in the group have the same

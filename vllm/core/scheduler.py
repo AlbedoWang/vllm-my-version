@@ -103,6 +103,8 @@ class Scheduler:
         self.running: Deque[SequenceGroup] = deque()
         # Sequence groups in the SWAPPED state.
         self.swapped: Deque[SequenceGroup] = deque()
+        # NOTE(KJ.W): Add Sequence groups in the PAUSED state.
+        self.paused: Deque[SequenceGroup] = deque()
 
     @property
     def lora_enabled(self) -> bool:
@@ -111,6 +113,13 @@ class Scheduler:
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the waiting queue.
         self.waiting.append(seq_group)
+    
+    def get_paused_group(self, request_id: str) -> Optional[SequenceGroup]:
+        for seq_group in self.paused:
+            if seq_group.request_id == request_id:
+                return seq_group
+        logger.warning(f"Sequence group with request ID {request_id} not found in paused sequence groups.")
+        return None
 
     def abort_seq_group(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a sequence group with the given ID.
@@ -377,6 +386,8 @@ class Scheduler:
                 seq_data[seq_id] = seq.data
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
+            
+            # print("block_tables: ", block_tables)
 
             seq_group_metadata = SequenceGroupMetadata(
                 request_id=seq_group.request_id,
@@ -397,6 +408,42 @@ class Scheduler:
 
     def free_seq(self, seq: Sequence) -> None:
         self.block_manager.free(seq)
+    
+    # NOTE(KJ.W): Add a function to preserve paused sequence groups.
+    def preserve_paused_seq_groups(self) -> None:
+        self.paused.extend(seq_group for seq_group in self.running
+                           if seq_group.is_paused())
+
+    # NOTE(KJ.W): Add a function to pop paused sequence groups from running groups.
+    def pop_paused_seq_groups(self) -> None:
+        self.running = deque(seq_group for seq_group in self.running
+                            if not seq_group.is_paused())
+    
+    # NOTE(KJ.W): pop paused sequence group with request id from PAUSED queue
+    def pop_paused_seq_group_with_id(self, request_id) -> None:
+        seq_group_to_pop = None
+        for seq_group in self.paused:
+            if seq_group.request_id == request_id:
+                seq_group_to_pop = seq_group
+                break
+        if seq_group_to_pop:
+            self.paused.remove(seq_group_to_pop)
+        else:
+            logger.warning(f"Sequence group with request ID {request_id} not found in paused sequence groups.")
+    
+    # NOTE(KJ.W): Add a function to remove paused sequence groups.
+    def remove_paused_seq_group(self, request_id) -> None:
+        seq_group_to_remove = None
+        for seq_group in self.paused:
+            if seq_group.request_id == request_id:
+                seq_group_to_remove = seq_group
+                break
+        if seq_group_to_remove:
+            self.paused.remove(seq_group_to_remove)
+            for seq in seq_group_to_remove.get_seqs():
+                self.free_seq(seq)
+        else:
+            logger.warning(f"Sequence group with request ID {request_id} not found in paused sequence groups.")
 
     def free_finished_seq_groups(self) -> None:
         self.running = deque(seq_group for seq_group in self.running

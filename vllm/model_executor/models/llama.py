@@ -306,11 +306,11 @@ class LlamaModel(nn.Module):
                     self.swap_events[i].wait()
                 
                 if blocks_to_swap_in is not None and i+1 in blocks_to_swap_in:
-                    event = cache_engine.swap_in(blocks_to_swap_in[i+1])
+                    event = cache_engine.layer_swap_in(blocks_to_swap_in[i+1])
                 elif blocks_to_swap_out is not None and i+1 in blocks_to_swap_out:
-                    event = cache_engine.swap_out(blocks_to_swap_out[i+1])
+                    event = cache_engine.layer_swap_out(blocks_to_swap_out[i+1])
                 elif blocks_to_copy is not None and i+1 in blocks_to_copy:
-                    event = cache_engine.copy(blocks_to_copy[i+1])
+                    event = cache_engine.layer_copy(blocks_to_copy[i+1])
                 else:
                     event = None
                 

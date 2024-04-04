@@ -212,6 +212,14 @@ class Sequence:
         self._append_tokens_to_blocks([token_id])
         self.output_logprobs.append(logprobs)
         self.data.append_token_id(token_id, logprobs[token_id].logprob)
+    
+    # NOTE(KJ.W): Add extend token id
+    def extend_token_id(
+        self,
+        token_ids: List[int],
+    ) -> None:
+        # print("[Sequence] Append token_ids:", token_ids)
+        self._append_tokens_to_blocks(token_ids)
 
     def get_len(self) -> int:
         return self.data.get_len()
@@ -255,6 +263,10 @@ class Sequence:
 
     def is_finished(self) -> bool:
         return SequenceStatus.is_finished(self.status)
+    
+    # NOTE(KJ.W): Add is_paused
+    def is_paused(self) -> bool:
+        return self.status == SequenceStatus.FINISHED_PAUSED
 
     def fork(self, new_seq_id: int) -> "Sequence":
         new_seq = copy.deepcopy(self)
@@ -264,7 +276,11 @@ class Sequence:
     def __repr__(self) -> str:
         return (f"Sequence(seq_id={self.seq_id}, "
                 f"status={self.status.name}, "
-                f"num_blocks={len(self.logical_token_blocks)})")
+                f"num_blocks={len(self.logical_token_blocks)}),"
+                f"prompt={self.prompt},"
+                f"output_text={self.output_text},"
+                f"output_logprobs={self.output_logprobs},"
+                f"data={self.data})")
 
 
 @dataclass
@@ -321,6 +337,25 @@ class SequenceGroup:
     @property
     def lora_int_id(self) -> int:
         return self.lora_request.lora_int_id if self.lora_request else 0
+    
+    # NOTE(KJ.W)
+    def update_seq_group_token_ids(
+        self, 
+        prompt: str, 
+        token_ids: List[int],
+        ) -> None:
+        token_ids_to_append = token_ids[len(self.prompt_token_ids)-1:]
+        # print("[*]seq token: ", len(self.get_seqs()[0].data.prompt_token_ids))
+        for seq in self.get_seqs():
+            # print("[*]seq info before: ", seq)
+            seq.prompt = prompt
+            seq.data.prompt_token_ids = token_ids
+            seq.data.output_token_ids = []
+            seq.data.cumulative_logprob = 0.0
+            seq.tokens = None
+            seq.output_logprobs = []
+            seq.extend_token_id(token_ids_to_append)
+        # print("[*]after seq token: ", len(self.get_seqs()[0].data.prompt_token_ids))
 
     def get_last_latency(self, now: float) -> float:
         """Gets last token latency for Request level timings."""
@@ -402,14 +437,26 @@ class SequenceGroup:
         if seq_id not in self.seqs_dict:
             raise ValueError(f"Sequence {seq_id} not found.")
         del self.seqs_dict[seq_id]
+    
+    # NOTE(KJ.W): Activate all sequences in the PAUSED sequence group to RUNING
+    def activate_seq_group(self) -> None:
+        for seq in self.get_seqs():
+            seq.status = SequenceStatus.RUNNING
 
+    # NOTE(KJ.W): Changed the is_finished function to check if all the sequences are finished or paused
     def is_finished(self) -> bool:
-        return all(seq.is_finished() for seq in self.get_seqs())
+        return all(seq.is_finished() or seq.is_paused() for seq in self.get_seqs())
+    
+    # NOTE(KJ.W): Add is_paused function to check if all the sequences are paused
+    def is_paused(self) -> bool:
+        return all(seq.is_paused() for seq in self.get_seqs())
 
     def __repr__(self) -> str:
         return (f"SequenceGroup(request_id={self.request_id}, "
                 f"sampling_params={self.sampling_params}, "
-                f"num_seqs={len(self.seqs_dict)})")
+                f"num_seqs={len(self.seqs_dict)})"
+                f"seqs={self.seqs_dict},"
+                f"metrics={self.metrics}")
 
 
 class SequenceGroupMetadata:
@@ -449,7 +496,14 @@ class SequenceGroupMetadata:
     @property
     def lora_int_id(self) -> int:
         return self.lora_request.lora_int_id if self.lora_request else 0
-
+    
+    def __repr__(self):
+        return (f"SequenceGroupMetadata(request_id={self.request_id}, "
+                f"is_prompt={self.is_prompt}, "
+                f"seq_data={self.seq_data}, "
+                f"sampling_params={self.sampling_params}, "
+                f"block_tables={self.block_tables}, "
+                f"lora_request={self.lora_request})")
 
 class SequenceOutput:
     """The model output associated with a sequence.

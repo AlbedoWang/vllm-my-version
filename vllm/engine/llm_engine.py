@@ -45,6 +45,7 @@ DEVICE_TO_WORKER_MODULE_MAP = {
 # Run VLLM with VLLM_USE_RAY_COMPILED_DAG=1 to enable it.
 USE_RAY_COMPILED_DAG = bool(os.getenv("VLLM_USE_RAY_COMPILED_DAG", 0))
 
+use_preserve = True
 
 class LLMEngine:
     """An LLM engine that receives requests and generates texts.
@@ -121,6 +122,7 @@ class LLMEngine:
 
         self.requests_seq_dict = {}
 
+
         # Create the parallel GPU workers.
         if self.parallel_config.worker_use_ray:
             # Disable Ray usage stats collection.
@@ -146,6 +148,8 @@ class LLMEngine:
 
         # Profile the memory usage and initialize the cache.
         self._init_cache()
+
+        self.seq_ever_added = []
 
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
@@ -424,7 +428,6 @@ class LLMEngine:
                                                      lora_request=lora_request)
         return prompt_token_ids
 
-    
 
     def add_request(
         self,
@@ -492,6 +495,8 @@ class LLMEngine:
             prompt=prompt,
             prompt_token_ids=prompt_token_ids,
             lora_request=lora_request)
+        
+        
 
         # Create the sequences.
         block_size = self.cache_config.block_size
@@ -504,12 +509,43 @@ class LLMEngine:
         sampling_params = sampling_params.clone()
 
         # Create the sequence group.
+        # print("[*]Create Sequence Group with request_id: ", request_id)
+        print("[DEBUGGER] Current Prompt: ", prompt)
+        print("[DEBUGGER] Current Samp Param: ", sampling_params)
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
                                   arrival_time, lora_request)
-
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
-
+    
+    # NOTE(KJ.W): Add update paused request
+    def update_paused_request(
+        self, 
+        request_id: str,
+        prompt: Optional[str],
+        sampling_params: SamplingParams,
+    ) -> None:
+        max_logprobs = self.get_model_config().max_logprobs
+        if (sampling_params.logprobs
+                and sampling_params.logprobs > max_logprobs) or (
+                    sampling_params.prompt_logprobs
+                    and sampling_params.prompt_logprobs > max_logprobs):
+            raise ValueError(f"Cannot request more than "
+                             f"{max_logprobs} logprobs.")
+        update_prompt_token_ids = self.encode_request(request_id=request_id, prompt=prompt)
+        seq_group = self.scheduler.get_paused_group(request_id)
+        self.scheduler.paused.remove(seq_group)
+        print("[DEBUGGER] Current Prompt: ", prompt)
+        print("[DEBUGGER] New sampling params: ", sampling_params)
+        print("[DEBUGGER] Current seq_group.sampling_params: ", seq_group.sampling_params)
+        seq_group.sampling_params = sampling_params
+        seq_group.update_seq_group_token_ids(
+            prompt=prompt, 
+            token_ids=update_prompt_token_ids)
+        self.scheduler.block_manager.extend_block_tables(seq_group)
+        seq_group.activate_seq_group()
+        self.scheduler.running.append(seq_group)
+        
+        
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a request(s) with the given ID.
 
@@ -655,7 +691,8 @@ class LLMEngine:
             for seq, parent in child_seqs:
                 if seq is not parent:
                     seq_group.add(seq)
-                    if not seq.is_finished():
+                    # NOTE(KJ.W) Changed the condition to check if the sequence is finished or paused
+                    if not seq.is_finished() and seq.status != SequenceStatus.FINISHED_PAUSED:
                         self.scheduler.fork_seq(parent, seq)
 
             # Free the finished and selected parent sequences' memory in block
@@ -665,6 +702,9 @@ class LLMEngine:
             for seq, parent in child_seqs:
                 if seq is parent and seq.is_finished():
                     self.scheduler.free_seq(seq)
+                # NOTE(KJ.W) Added the condition to check if the sequence is paused
+                elif seq is parent and seq.is_paused():
+                    pass
             return
 
         # Beam search case
@@ -784,9 +824,21 @@ class LLMEngine:
         for seq_group, outputs in zip(scheduled_seq_groups, output):
             self._process_sequence_group_outputs(seq_group, outputs)
 
+        # NOTE(KJ.W): Added preserve sequence groups function
+        self.scheduler.preserve_paused_seq_groups()
+        
+        # NOTE(KJ.W): pop paused sequence groups from RUNNING queue
+        self.scheduler.pop_paused_seq_groups()
+
         # Free the finished sequence groups.
         self.scheduler.free_finished_seq_groups()
 
+        # print("[%] Current scheduler:"
+        #       f"\n\t- Running:  {len(self.scheduler.running)},"
+        #       f"\n\t- Swapped:  {len(self.scheduler.swapped)},"
+        #       f"\n\t- Waiting:  {len(self.scheduler.waiting)},"
+        #       f"\n\t- Paused:  {len(self.scheduler.paused)}")
+        
         # Create the outputs.
         request_outputs: List[RequestOutput] = []
         for seq_group in scheduled_seq_groups:
@@ -802,6 +854,14 @@ class LLMEngine:
             self.stat_logger.log(self._get_stats(scheduler_outputs))
 
         return request_outputs
+    
+    # NOTE(KJ.W): Pop paused sequence group with request id from PAUSED queue
+    def pop_paused_seq_group(self, request_id: str) -> None:
+        self.scheduler.pop_paused_seq_group_with_id(request_id)
+
+    # NOTE(KJ.W): Remove and free sequence group with request id from PAUSED queue
+    def remove_paused_seq_group(self, request_id: str) -> None:
+        self.scheduler.remove_paused_seq_group(request_id)
 
     def step(self) -> List[RequestOutput]:
         """Performs one decoding iteration and returns newly generated results.
@@ -856,6 +916,8 @@ class LLMEngine:
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
+
+        # print("[*]seq_group_metadata_list: ", seq_group_metadata_list)
         if not scheduler_outputs.is_empty():
             # Execute the model.
             all_outputs = self._run_workers(
@@ -993,16 +1055,22 @@ class LLMEngine:
         seq.prefix_offset = prefix_offset
         seq.read_offset = read_offset
         seq.output_text += new_output_text
+    
 
+    #(KJ.W) Modified to include the use_preserve
     def _check_stop(self, seq: Sequence,
-                    sampling_params: SamplingParams,
-                    use_preserve=False ) -> None:
+                    sampling_params: SamplingParams) -> None:
+        
+        # NOTE(KJ.W): Added the use_preserve
         """Stop the finished sequences."""
         for stop_str in sampling_params.stop:
             if seq.output_text.endswith(stop_str):
                 self._finalize_sequence(seq, sampling_params, stop_str)
+                print(seq.output_text)
+                # print("[RES] seq output token ids:", seq.get_token_ids())
                 # seq.status = SequenceStatus.FINISHED_STOPPED
                 if use_preserve:
+                    print(f'PAUSED {seq.seq_id}')
                     seq.status = SequenceStatus.FINISHED_PAUSED
                 else:
                     seq.status = SequenceStatus.FINISHED_STOPPED
@@ -1034,6 +1102,7 @@ class LLMEngine:
             # seq.status = SequenceStatus.FINISHED_STOPPED
             if use_preserve:
                 seq.status = SequenceStatus.FINISHED_PAUSED
+                # print(f'PAUSED {seq.seq_id}')
             else:
                 seq.status = SequenceStatus.FINISHED_STOPPED
             return
@@ -1158,3 +1227,23 @@ class LLMEngine:
         if dead_actors:
             raise RuntimeError("At least one Worker is dead. "
                                f"Dead Workers: {dead_actors}. ")
+    
+    #(KJ.W) New function for reactivating or kill the paused sequence
+    def reactivate_sequence(self, request_id: str, additional_pormpt: str):
+        if request_id not in self.paused_sequences:
+            return
+        paused_seq = self.paused_sequences.pop(request_id)
+        additional_prompt_token_ids = self.encode_request(
+            request_id = request_id,
+            prompt = additional_pormpt,
+            lora_request = paused_seq.lora_request,
+        )
+        paused_seq.prompt_token_ids.extend(additional_prompt_token_ids)
+        paused_seq.status = SequenceStatus.RUNNING
+    
+    def kill_paused_sequence(self, request_id: str):
+        if request_id not in self.paused_sequences:
+            return
+        paused_seq = self.paused_sequences.pop(request_id)
+        self.scheduler.free_seq(paused_seq)
+        

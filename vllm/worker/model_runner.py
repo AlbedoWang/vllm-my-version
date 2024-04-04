@@ -305,7 +305,17 @@ class ModelRunner:
                 context_lens.append(context_len)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
-                block_number = block_table[position // self.block_size]
+                
+                # NOTE(KJ.W): Add logger for debugging
+                try:
+                    block_number = block_table[position // self.block_size]
+                except:
+                    logger.error(f"Block table: {block_table}")
+                    logger.error(f"Position: {position}")
+                    logger.error(f"Block size: {self.block_size}")
+                    logger.error(f"Seqence id: {seq_id}")
+                    raise
+                
                 block_offset = position % self.block_size
                 slot = block_number * self.block_size + block_offset
                 slot_mapping.append([slot])
