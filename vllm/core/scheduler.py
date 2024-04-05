@@ -105,6 +105,8 @@ class Scheduler:
         self.swapped: Deque[SequenceGroup] = deque()
         # NOTE(KJ.W): Add Sequence groups in the PAUSED state.
         self.paused: Deque[SequenceGroup] = deque()
+        # NOTE(KJ.W): Add Sequence group for Mamba-Back
+        self.mambaback: Deque[SequenceGroup] = deque()
 
     @property
     def lora_enabled(self) -> bool:
@@ -158,7 +160,7 @@ class Scheduler:
                     self.free_seq(seq)
 
     def has_unfinished_seqs(self) -> bool:
-        return self.waiting or self.running or self.swapped
+        return self.waiting or self.running or self.swapped or self.mambaback
 
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
@@ -261,6 +263,18 @@ class Scheduler:
 
             self.waiting.extendleft(leftover_waiting_sequences)
 
+            while self.mambaback:
+                # If there are sequence groups in the Mamba-Back queue,
+                # we schedule them first.
+                seq_group = self.mambaback.popleft()
+                num_new_seqs = seq_group.get_max_num_running_seqs()
+                if (num_curr_seqs + num_new_seqs >
+                        self.scheduler_config.max_num_seqs):
+                    break
+                num_curr_seqs += num_new_seqs
+                self.running.append(seq_group)
+                scheduled.append(seq_group)
+
             if scheduled or ignored_seq_groups:
                 scheduler_outputs = SchedulerOutputs(
                     scheduled_seq_groups=scheduled,
@@ -273,7 +287,7 @@ class Scheduler:
                     ignored_seq_groups=ignored_seq_groups,
                 )
                 return scheduler_outputs
-
+        
         # NOTE(woosuk): Preemption happens only when there is no available slot
         # to keep all the sequence groups in the RUNNING state.
         # In this case, the policy is responsible for deciding which sequence
@@ -386,8 +400,6 @@ class Scheduler:
                 seq_data[seq_id] = seq.data
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
-            
-            # print("block_tables: ", block_tables)
 
             seq_group_metadata = SequenceGroupMetadata(
                 request_id=seq_group.request_id,

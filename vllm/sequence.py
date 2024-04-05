@@ -20,6 +20,7 @@ PromptLogprobs = List[Optional[Dict[int, Logprob]]]
 SampleLogprobs = List[Dict[int, Logprob]]
 
 
+# NOTE(KJ.W): Add a new status for the paused sequence
 class SequenceStatus(enum.Enum):
     """Status of a sequence."""
     WAITING = enum.auto()
@@ -29,7 +30,6 @@ class SequenceStatus(enum.Enum):
     FINISHED_LENGTH_CAPPED = enum.auto()
     FINISHED_ABORTED = enum.auto()
     FINISHED_IGNORED = enum.auto()
-
     FINISHED_PAUSED = enum.auto()
 
     @staticmethod
@@ -218,7 +218,6 @@ class Sequence:
         self,
         token_ids: List[int],
     ) -> None:
-        # print("[Sequence] Append token_ids:", token_ids)
         self._append_tokens_to_blocks(token_ids)
 
     def get_len(self) -> int:
@@ -333,6 +332,10 @@ class SequenceGroup:
         # All sequences in the group should have the same prompt.
         # We use the prompt of an arbitrary sequence.
         return next(iter(self.seqs_dict.values())).data.prompt_token_ids
+    
+    @property
+    def output_token_ids(self) -> List[int]:
+        return next(iter(self.seqs_dict.values())).data.output_token_ids
 
     @property
     def lora_int_id(self) -> int:
@@ -344,19 +347,19 @@ class SequenceGroup:
         prompt: str, 
         token_ids: List[int],
         ) -> None:
-        token_ids_to_append = token_ids[len(self.prompt_token_ids)-1:]
-        # print("[*]seq token: ", len(self.get_seqs()[0].data.prompt_token_ids))
+        id_list = token_ids[len(self.prompt_token_ids)+len(self.output_token_ids)-1:]
+        token_ids_to_append = id_list
+        pre_logical_token_block_len = len(self.get_seqs()[0].logical_token_blocks)
         for seq in self.get_seqs():
-            # print("[*]seq info before: ", seq)
             seq.prompt = prompt
             seq.output_text = ""
-            seq.data.prompt_token_ids = token_ids
-            seq.data.output_token_ids = []
-            seq.data.cumulative_logprob = 0.0
+            seq.data = SequenceData(token_ids)
             seq.tokens = None
             seq.output_logprobs = []
             seq.extend_token_id(token_ids_to_append)
-        # print("[*]after seq token: ", len(self.get_seqs()[0].data.prompt_token_ids))
+        after_logical_token_block_len = len(self.get_seqs()[0].logical_token_blocks)
+        extend_logical_token_len = after_logical_token_block_len - pre_logical_token_block_len
+        return extend_logical_token_len
 
     def get_last_latency(self, now: float) -> float:
         """Gets last token latency for Request level timings."""

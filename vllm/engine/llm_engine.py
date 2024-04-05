@@ -34,6 +34,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
+# Add param for PRESERVE
+USE_PRESERVE = False
+
 # A map between the device type (in device config) to its worker module.
 DEVICE_TO_WORKER_MODULE_MAP = {
     "cuda": "vllm.worker.worker",
@@ -44,8 +47,6 @@ DEVICE_TO_WORKER_MODULE_MAP = {
 # which optimizes the control plane overhead.
 # Run VLLM with VLLM_USE_RAY_COMPILED_DAG=1 to enable it.
 USE_RAY_COMPILED_DAG = bool(os.getenv("VLLM_USE_RAY_COMPILED_DAG", 0))
-
-use_preserve = True
 
 class LLMEngine:
     """An LLM engine that receives requests and generates texts.
@@ -121,6 +122,7 @@ class LLMEngine:
         self.seq_counter = Counter()
 
         self.requests_seq_dict = {}
+        self.use_preserve = USE_PRESERVE
 
 
         # Create the parallel GPU workers.
@@ -496,27 +498,20 @@ class LLMEngine:
             prompt_token_ids=prompt_token_ids,
             lora_request=lora_request)
         
-        # print("[*]Add Request with request_id: ", request_id)
-        # print("[*]Prompt: ", prompt)
-        # print("[*]Prompt Token IDs: ", prompt_token_ids)
-        
         # Create the sequences.
         block_size = self.cache_config.block_size
         seq_id = next(self.seq_counter)
         seq = Sequence(seq_id, prompt, prompt_token_ids, block_size,
                        lora_request)
 
-        # print("[*]Sequence info: ", seq)
         # Defensive copy of SamplingParams, which are used by the sampler,
         # this doesn't deep-copy LogitsProcessor objects
         sampling_params = sampling_params.clone()
 
         # Create the sequence group.
-        # print("[*]Create Sequence Group with request_id: ", request_id)
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
                                   arrival_time, lora_request)
         
-        # print("[*]Sequence Group info: ", seq_group)
         
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
@@ -538,19 +533,17 @@ class LLMEngine:
         update_prompt_token_ids = self.encode_request(request_id=request_id, prompt=prompt)
         seq_group = self.scheduler.get_paused_group(request_id)
         self.scheduler.paused.remove(seq_group)
-        # print("[DEBUGGER] Current Prompt: ", prompt)
-        # print("[DEBUGGER] New sampling params: ", sampling_params)
-        # print("[DEBUGGER] Current seq_group.sampling_params: ", seq_group.sampling_params)
+
         seq_group.sampling_params = sampling_params
-        seq_group.update_seq_group_token_ids(
+        update_logical_len = seq_group.update_seq_group_token_ids(
             prompt=prompt, 
-            token_ids=update_prompt_token_ids)
-        # print("[*]Prompt Token IDs: ", seq_group.prompt_token_ids)
-        self.scheduler.block_manager.extend_block_tables(seq_group)
+            token_ids=update_prompt_token_ids,)
+        
+        self.scheduler.block_manager.extend_block_tables(seq_group, update_logical_len)
+
         seq_group.activate_seq_group()
-        # print("[*]Sequence Info: ", seq_group.get_seqs()[0])
-        # print("[*]Group Info: ", seq_group)
-        self.scheduler.running.append(seq_group)
+        self.scheduler.mambaback.append(seq_group)
+        # self.scheduler.running.append(seq_group)
         
         
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
@@ -923,13 +916,11 @@ class LLMEngine:
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
-
-        # print("[*]seq_group_metadata_list: ", seq_group_metadata_list)
         if not scheduler_outputs.is_empty():
             # Execute the model.
             all_outputs = self._run_workers(
-                # "execute_model",
-                "overlapped_execute_model",
+                "execute_model",
+                # "overlapped_execute_model",
                 driver_kwargs={
                     "seq_group_metadata_list": seq_group_metadata_list,
                     "blocks_to_swap_in": scheduler_outputs.blocks_to_swap_in,
@@ -937,7 +928,7 @@ class LLMEngine:
                     "blocks_to_copy": scheduler_outputs.blocks_to_copy,
                 },
                 use_ray_compiled_dag=USE_RAY_COMPILED_DAG)
-
+            
             # Only the driver worker returns the sampling results.
             output = all_outputs[0]
         else:
@@ -1064,7 +1055,7 @@ class LLMEngine:
         seq.output_text += new_output_text
     
 
-    #(KJ.W) Modified to include the use_preserve
+    # NOTE(KJ.W) Modified to include the use_preserve
     def _check_stop(self, seq: Sequence,
                     sampling_params: SamplingParams) -> None:
         
@@ -1073,11 +1064,9 @@ class LLMEngine:
         for stop_str in sampling_params.stop:
             if seq.output_text.endswith(stop_str):
                 self._finalize_sequence(seq, sampling_params, stop_str)
-                print(seq.output_text)
-                # print("[RES] seq output token ids:", seq.get_token_ids())
                 # seq.status = SequenceStatus.FINISHED_STOPPED
-                if use_preserve:
-                    print(f'PAUSED {seq.seq_id}')
+                if self.use_preserve:
+                    # print(f'PAUSED {seq.seq_id}')
                     seq.status = SequenceStatus.FINISHED_PAUSED
                 else:
                     seq.status = SequenceStatus.FINISHED_STOPPED
@@ -1087,7 +1076,7 @@ class LLMEngine:
                 seq.get_last_token_id())
             self._finalize_sequence(seq, sampling_params, stop_str)
             # seq.status = SequenceStatus.FINISHED_STOPPED
-            if use_preserve:
+            if self.use_preserve:
                 seq.status = SequenceStatus.FINISHED_PAUSED
             else:
                 seq.status = SequenceStatus.FINISHED_STOPPED
@@ -1107,9 +1096,8 @@ class LLMEngine:
         if ((not sampling_params.ignore_eos) and seq.get_last_token_id()
                 == self.get_tokenizer_for_seq(seq).eos_token_id):
             # seq.status = SequenceStatus.FINISHED_STOPPED
-            if use_preserve:
+            if self.use_preserve:
                 seq.status = SequenceStatus.FINISHED_PAUSED
-                # print(f'PAUSED {seq.seq_id}')
             else:
                 seq.status = SequenceStatus.FINISHED_STOPPED
             return

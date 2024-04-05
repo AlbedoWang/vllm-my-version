@@ -30,6 +30,7 @@ parser.add_argument("--rps", type=int, default=2, help="request per second")
 parser.add_argument("--nGPU", type=int, default=1, help="request per second")
 parser.add_argument("--kv_cache_ratio", type=float, default=-1.0, help="manually set the kv_cache_ratio for computing the number of kv cache block")
 parser.add_argument("--prefix_cache", type=bool, default=False, help="enable prefix caching")
+parser.add_argument("--device", type=str, default="cuda", help="set device name")
 
 
 def get_request_output(llm):
@@ -41,17 +42,17 @@ def get_request_output(llm):
             if output.finished:
                 res = output.outputs[0]
                 output_text = output.outputs[0].text
-    # print("[*]Output: ", res)
     end_time = time.time()
     return output_text, end_time - start_time
 
 def math_action_parsing(thought_action, this_request):
     step = this_request.step
-    # print("[*]Current step: ", step)
     try:
         thought, action = thought_action.strip().split(f"Action {step}: ")
-        # print("[*]Thought: ", thought)
-        # print("[*]Action: ", action)
+
+        print("[*]Thought: ", thought)
+        print("[*]Action: ", action)
+
         # parse the action
         if action.startswith("Add"):
             action_type = 1
@@ -77,11 +78,9 @@ def math_action_parsing(thought_action, this_request):
         number_list = [int(x) if x.isdigit() else float(x) for x in number_list]
         this_request.extend_thought(thought)
         this_request.extend_action(action)
-        # print("[*]action_type: ", action_type)
-        # print("[*]number_list: ", number_list)
         return action_type, number_list
     except:
-        print("[ERROR]Error: action parsing failed.", "\n\n", thought_action, step, "\n\n")
+        print("[ERROR]Error: action parsing failed.", "\n\n", "thought_action", thought_action, "step", step, "\n\n")
         return 0, [None]
     
 def calculator(action, number_list):
@@ -127,6 +126,8 @@ if __name__ == "__main__":
     total_step = 0
     request_log_list = []
 
+    use_preserve = False
+
     if args.quantized:
         model_name = "llama-2-{}B-Chat-AWQ".format(args.model)
         model_dir = "/global/cfs/cdirs/m4243/Zheng/huggingface_llama_model/Llama-2-{}B-Chat-AWQ".format(args.model)
@@ -137,7 +138,7 @@ if __name__ == "__main__":
     model_name = "meta-llama/Llama-2-7b-chat-hf"
     model_dir = None
 
-    llm = LLM(model="meta-llama/Llama-2-7b-chat-hf", enforce_eager=True, tensor_parallel_size=args.nGPU, enable_prefix_caching=args.prefix_cache)
+    llm = LLM(model="meta-llama/Llama-2-7b-chat-hf", enforce_eager=True, tensor_parallel_size=args.nGPU, enable_prefix_caching=args.prefix_cache, device=args.device)
     
     for i in range(10):
         question = inputs_and_answer[i][0]
@@ -156,10 +157,6 @@ if __name__ == "__main__":
         while llm.llm_engine.has_unfinished_requests():
             output, llm_latency = get_request_output(llm)
 
-            # print("="*40, i, "="*40)
-            # print("[*]Output: ", output)
-            # print("="*81)
-
             action_type, number_list = math_action_parsing(output, this_request)
 
             if action_type == 5: # finish
@@ -168,6 +165,7 @@ if __name__ == "__main__":
                 if abs(number_list[0] - answer) < 1e-3:
                     if_acc = True
                     n_correct += 1
+
                 # NOTE(KJ.W): Remove the paused sequence group
                 llm.llm_engine.remove_paused_seq_group(this_request.id)
                 print("Finish the request: ID-{}; Answer:{}; Label:{}".format(this_request.id, number_list[0], answer))
@@ -194,22 +192,21 @@ if __name__ == "__main__":
                 # print("================================================\n")
                 # print(f"Add request")
                 # print("================================================\n")
+
                 # print("[*]Current llm engine schedule:"
                 #     f"\n\t- Running: {len(llm.llm_engine.scheduler.running)}"
                 #     f"\n\t- Paused: {len(llm.llm_engine.scheduler.paused)}")
 
-                # llm.llm_engine.add_request(this_request.id, this_request.prompt, sampling_params)
-                llm.llm_engine.update_paused_request(this_request.id, this_request.prompt, sampling_params)
+                if not use_preserve:
+                    llm.llm_engine.add_request(this_request.id, this_request.prompt, sampling_params)
+                else:
+                    llm.llm_engine.update_paused_request(this_request.id, this_request.prompt, sampling_params)
                 
                 # print("[*]Current llm engine schedule(After update):"
                 #     f"\n\t- Running: {len(llm.llm_engine.scheduler.running)}"
                 #     f"\n\t- Paused: {len(llm.llm_engine.scheduler.paused)}"
                 #     f"\n\t- Waiting: {len(llm.llm_engine.scheduler.waiting)}")
                 # print("================================================\n")
-
-        # print("[*]Current llm engine schedule:"
-        #       f"\n\t- Running: {len(llm.llm_engine.scheduler.running)}"
-        #       f"\n\t- Paused: {len(llm.llm_engine.scheduler.paused)}")
         
         end_time = time.time()
         request_latency = end_time - start_time
@@ -217,7 +214,6 @@ if __name__ == "__main__":
         total_step += this_request.step
         print("Request ID-{}; Latency:{}".format(this_request.id, end_time - start_time))
         request_log_list.append((this_request.id, if_acc, this_request.step, request_latency, answer, number_list[0]))
-
 
     output_file = "/home/kaijian_wang/vllm-my-version/react_result/react_{}_result_pid-{}-time-{}.txt".format(model_name.split('/')[-1], os.getpid(), datetime.now().strftime("%m-%d-%H-%M"))
     with open(output_file, "w+") as f:

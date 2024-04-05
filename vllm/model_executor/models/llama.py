@@ -292,15 +292,12 @@ class LlamaModel(nn.Module):
             
             if event is not None:
                 self.swap_events[0] = event
-        
-        # print("Swap event: 0 is waiting...")
 
         for i in range(len(self.layers)):
             layer = self.layers[i]
 
             # NOTE(KJ.W): Add swap event to asynchronize
             if cache_engine:
-                # print("Swap event: ", i, " is waiting...")
 
                 if self.swap_events[i] is not None:
                     self.swap_events[i].wait()
