@@ -48,6 +48,8 @@ class EngineArgs:
     max_cpu_loras: Optional[int] = None
     device: str = 'auto'
     ray_workers_use_nsight: bool = False
+    use_preserve: bool = False
+    use_swap: bool = False
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -301,7 +303,7 @@ class EngineArgs:
     def create_engine_configs(
         self,
     ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig,
-               DeviceConfig, Optional[LoRAConfig]]:
+               DeviceConfig, Optional[LoRAConfig], Optional[bool], Optional[bool]]:
         device_config = DeviceConfig(self.device)
         model_config = ModelConfig(
             self.model, self.tokenizer, self.tokenizer_mode,
@@ -324,7 +326,7 @@ class EngineArgs:
         scheduler_config = SchedulerConfig(self.max_num_batched_tokens,
                                            self.max_num_seqs,
                                            model_config.max_model_len,
-                                           self.max_paddings)
+                                           self.max_paddings,)
         lora_config = LoRAConfig(
             max_lora_rank=self.max_lora_rank,
             max_loras=self.max_loras,
@@ -332,8 +334,11 @@ class EngineArgs:
             lora_dtype=self.lora_dtype,
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
             and self.max_cpu_loras > 0 else None) if self.enable_lora else None
+        
+        use_preserve = self.use_preserve
+        use_swap = self.use_swap
         return (model_config, cache_config, parallel_config, scheduler_config,
-                device_config, lora_config)
+                device_config, lora_config, use_preserve, use_swap)
 
 
 @dataclass

@@ -123,6 +123,8 @@ class StatLogger:
     def __init__(self, local_interval: float, labels: Dict[str, str]) -> None:
         # Metadata for logging locally.
         self.last_local_log = time.monotonic()
+
+        # NOTE(KJ.W): local_interval is in seconds.
         self.local_interval = local_interval
 
         # Tracked stats over current local logging interval.
@@ -218,7 +220,9 @@ class StatLogger:
                 f"Swapped: {stats.num_swapped} reqs, "
                 f"Pending: {stats.num_waiting} reqs, "
                 f"GPU KV cache usage: {stats.gpu_cache_usage * 100:.1f}%, "
-                f"CPU KV cache usage: {stats.cpu_cache_usage * 100:.1f}%")
+                f"CPU KV cache usage: {stats.cpu_cache_usage * 100:.1f}%, "
+                f"GPU KV cache usage * Time: {stats.gpu_cache_usage * (stats.now - self.last_local_log) * 100:.1f}%*s, "
+                f"NTK: {float(np.sum(self.num_generation_tokens)) * (stats.now - self.last_local_log) * stats.gpu_cache_usage * 100:.1f}, ")
 
             # Reset tracked stats for next interval.
             self.num_prompt_tokens = []

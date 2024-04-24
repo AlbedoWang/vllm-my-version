@@ -194,7 +194,7 @@ class BlockSpaceManager:
 
         block_table: BlockTable = []
         block_table = self.block_tables[seq.seq_id]
-        for logical_idx in range(len(block_table) - 1, len(block_table) + extend_logical_len):
+        for logical_idx in range(len(block_table), len(block_table) + extend_logical_len + 1):
 
             if (self.block_sliding_window is not None
                     and logical_idx >= self.block_sliding_window):
@@ -207,6 +207,34 @@ class BlockSpaceManager:
 
         # Assign the block table for each sequence.
         for seq in seq_group.get_seqs(status=SequenceStatus.FINISHED_PAUSED):
+            self.block_tables[seq.seq_id] = block_table.copy()
+    
+    # NOTE(KJ.W): This function is used to extend the block tables for the sequences in the group
+    def extend_block_tables_to_swap_in(self, seq_group: SequenceGroup, extend_logical_len: int) -> None:
+        # NOTE: Here we assume that all sequences in the group have the same
+        # prompt.
+        seq = seq_group.get_seqs(status=SequenceStatus.SWAPPED)[0]
+
+        # Allocate new physical token blocks that will store the prompt tokens.
+        # num_prompt_blocks = len(seq.logical_token_blocks)
+
+        block_table: BlockTable = []
+        block_table = self.block_tables[seq.seq_id]
+        for logical_idx in range(len(block_table), len(block_table) + extend_logical_len + 1):
+
+            if (self.block_sliding_window is not None
+                    and logical_idx >= self.block_sliding_window):
+                block = block_table[logical_idx % self.block_sliding_window]
+            else:
+                block = self.cpu_allocator.allocate(
+                    seq.hash_of_block(logical_idx),
+                    seq.num_hashed_tokens_of_block(logical_idx))
+            block_table.append(block)
+        
+        # print("[*] current block table after extend: ", block_table)
+
+        # Assign the block table for each sequence.
+        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
             self.block_tables[seq.seq_id] = block_table.copy()
 
     def allocate(self, seq_group: SequenceGroup) -> None:
@@ -344,7 +372,11 @@ class BlockSpaceManager:
         for seq in seq_group.get_seqs():
             if seq.is_finished():
                 continue
-            blocks.update(self.block_tables[seq.seq_id])
+            try:
+                blocks.update(self.block_tables[seq.seq_id])
+            except:
+                print("[*]current seq id: ", seq.seq_id)
+                exit(1)
         return list(blocks)
 
     def can_swap_in(self, seq_group: SequenceGroup) -> bool:
@@ -381,6 +413,7 @@ class BlockSpaceManager:
             cpu_block.block_number: gpu_block.block_number
             for cpu_block, gpu_block in mapping.items()
         }
+        print("[*] current swap in: ", block_number_mapping)
         return block_number_mapping
 
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
@@ -411,6 +444,34 @@ class BlockSpaceManager:
             gpu_block.block_number: cpu_block.block_number
             for gpu_block, cpu_block in mapping.items()
         }
+        return block_number_mapping
+    
+    # NOTE(KJ.W): Add paused swap
+    def paused_swap_out(self, seq_group: SequenceGroup) -> Dict[int, int]:
+        # GPU block -> CPU block.
+        mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
+        for seq in seq_group.get_seqs(status=SequenceStatus.FINISHED_PAUSED):
+            new_block_table: BlockTable = []
+            block_table = self.block_tables[seq.seq_id]
+
+            for gpu_block in block_table:
+                if gpu_block in mapping:
+                    cpu_block = mapping[gpu_block]
+                    cpu_block.ref_count += 1
+                else:
+                    cpu_block = self.cpu_allocator.allocate(
+                        gpu_block.block_hash, gpu_block.num_hashed_tokens)
+                    mapping[gpu_block] = cpu_block
+                new_block_table.append(cpu_block)
+                # Free the GPU block swapped out to CPU.
+                self.gpu_allocator.free(gpu_block)
+            self.block_tables[seq.seq_id] = new_block_table
+
+        block_number_mapping = {
+            gpu_block.block_number: cpu_block.block_number
+            for gpu_block, cpu_block in mapping.items()
+        }
+        # print("[*] current swap out: ", block_number_mapping)
         return block_number_mapping
 
     def _free_block_table(self, block_table: BlockTable) -> None:

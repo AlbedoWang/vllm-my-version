@@ -278,51 +278,65 @@ class LlamaModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
 
-        # NOTE(KJ.W): if cache engine is not None, we will swap in/out or copy blocks
+        swap_in_stream = torch.cuda.Stream()
+        swap_out_stream = torch.cuda.Stream()
+        copy_stream = torch.cuda.Stream()
+
         if cache_engine:
+            self.swap_events = cache_engine.events
 
-            if len(blocks_to_swap_in) != 0:
-                event = cache_engine.layer_swap_in(blocks_to_swap_in[0])
-            elif len(blocks_to_swap_out) != 0:
-                event = cache_engine.layer_swap_out(blocks_to_swap_out[0])
-            elif len(blocks_to_copy) != 0:
-                event = cache_engine.layer_copy(blocks_to_copy[0])
-            else:
-                event = None
+            with torch.cuda.stream(copy_stream):
+                if blocks_to_copy:
+                    cache_engine.layer_copy(blocks_to_copy)
+                    
+            with torch.cuda.stream(swap_out_stream):
+                for i in range(2):
+                    cache_engine.layer_swap_out(blocks_to_swap_out, i)
+                    self.swap_events[i].record(stream=swap_out_stream)
+                cache_engine.layer_swap_out(blocks_to_swap_out, 0)
+                self.swap_events[0].record(stream=swap_out_stream)
             
-            if event is not None:
-                self.swap_events[0] = event
+            self.swap_events[0].synchronize()
 
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
+            for i in range(len(self.layers)):
 
-            # NOTE(KJ.W): Add swap event to asynchronize
-            if cache_engine:
-
-                if self.swap_events[i] is not None:
-                    self.swap_events[i].wait()
+                layer = self.layers[i]
                 
-                if blocks_to_swap_in is not None and i+1 in blocks_to_swap_in:
-                    event = cache_engine.layer_swap_in(blocks_to_swap_in[i+1])
-                elif blocks_to_swap_out is not None and i+1 in blocks_to_swap_out:
-                    event = cache_engine.layer_swap_out(blocks_to_swap_out[i+1])
-                elif blocks_to_copy is not None and i+1 in blocks_to_copy:
-                    event = cache_engine.layer_copy(blocks_to_copy[i+1])
-                else:
-                    event = None
+                if i + 2 < len(self.layers) and blocks_to_swap_out:
+                    with torch.cuda.stream(swap_out_stream):
+                        cache_engine.layer_swap_out(blocks_to_swap_out, i + 2)
+                        self.swap_events[i + 2].record(stream=swap_out_stream)
                 
-                if event is not None:
-                    self.swap_events[i] = event
+                if i + 1 < len(self.layers) and blocks_to_swap_in:
+                    with torch.cuda.stream(swap_in_stream):
+                        cache_engine.layer_swap_in(blocks_to_swap_in, i + 1)
+                        self.swap_events[i + 1].record(stream=swap_in_stream)
+                
+                if i > 0:
+                    self.swap_events[i].synchronize()
 
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                kv_caches[i],
-                input_metadata,
-                residual,
-            )
-        
-        self.swap_events[-1].wait()
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    kv_caches[i],
+                    input_metadata,
+                    residual,
+                )
+
+            self.swap_events[-1].synchronize()
+
+        else:
+            for i in range(len(self.layers)):
+
+                layer = self.layers[i]
+
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    kv_caches[i],
+                    input_metadata,
+                    residual,
+                )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states

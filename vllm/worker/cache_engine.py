@@ -172,11 +172,11 @@ class CacheEngine:
                                     src_to_dst)
 
     # NOTE(KJ.W): define swap operation for layer
-    def layer_swap_in(self, src_to_dst: Dict[int, int]) -> None:
-        self._layer_swap(self.cpu_cache, self.gpu_cache, src_to_dst)
+    def layer_swap_in(self, src_to_dst: Dict[int, int], layer_id: int) -> None:
+        self._layer_swap(self.cpu_cache, self.gpu_cache, src_to_dst, layer_id)
     
-    def layer_swap_out(self, src_to_dst: Dict[int, int]) -> None:
-        self._layer_swap(self.gpu_cache, self.cpu_cache, src_to_dst)
+    def layer_swap_out(self, src_to_dst: Dict[int, int], layer_id: int) -> None:
+        self._layer_swap(self.gpu_cache, self.cpu_cache, src_to_dst, layer_id)
     
     def layer_copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
         self.copy(src_to_dsts)

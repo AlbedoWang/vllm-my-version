@@ -19,7 +19,8 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import (Logprob, SamplerOutput, Sequence, SequenceGroup,
-                           SequenceGroupOutput, SequenceOutput, SequenceStatus)
+                           SequenceGroupOutput, SequenceOutput, SequenceStatus,
+                           SequenceGroupDecision)
 from vllm.transformers_utils.tokenizer import (detokenize_incrementally,
                                                TokenizerGroup)
 from vllm.utils import (Counter, set_cuda_visible_devices, get_ip,
@@ -34,8 +35,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
-# Add param for PRESERVE
-USE_PRESERVE = False
+# Add param for PRESERVE and PIPELINING_SWAP
+USE_PRESERVE = True
 
 # A map between the device type (in device config) to its worker module.
 DEVICE_TO_WORKER_MODULE_MAP = {
@@ -84,8 +85,10 @@ class LLMEngine:
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
+        use_preserve: Optional[bool],
+        use_swap: Optional[bool],
         placement_group: Optional["PlacementGroup"],
-        log_stats: bool,
+        log_stats: bool = True,
     ) -> None:
         logger.info(
             f"Initializing an LLM engine (v{vllm.__version__}) with config: "
@@ -106,7 +109,9 @@ class LLMEngine:
             f"kv_cache_dtype={cache_config.cache_dtype}, "
             f"device_config={device_config.device}, "
             f"seed={model_config.seed}, "
-            f"enable_prefix_caching={cache_config.enable_prefix_caching})")
+            f"enable_prefix_caching={cache_config.enable_prefix_caching}, "
+            f"use_preserve={use_preserve}, "
+            f"use_swap={use_swap})")
         # TODO(woosuk): Print more configs in debug mode.
 
         self.model_config = model_config
@@ -115,15 +120,19 @@ class LLMEngine:
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.device_config = device_config
-        self.log_stats = log_stats
+        
+        # NOTE(KJ.W): Log stats
+        # self.log_stats = log_stats
+        self.log_stats = True
+        
         self._verify_args()
 
         self._init_tokenizer()
         self.seq_counter = Counter()
 
         self.requests_seq_dict = {}
-        self.use_preserve = USE_PRESERVE
-
+        self.use_preserve = use_preserve
+        self.use_swap = use_swap
 
         # Create the parallel GPU workers.
         if self.parallel_config.worker_use_ray:
@@ -154,7 +163,7 @@ class LLMEngine:
         self.seq_ever_added = []
 
         # Create the scheduler.
-        self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+        self.scheduler = Scheduler(scheduler_config, cache_config, lora_config, use_swap)
 
         # Metric Logging.
         if self.log_stats:
@@ -439,6 +448,7 @@ class LLMEngine:
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
+        decision: Optional[SequenceGroupDecision] = None,
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -504,13 +514,15 @@ class LLMEngine:
         seq = Sequence(seq_id, prompt, prompt_token_ids, block_size,
                        lora_request)
 
+        # print("[*] add seq: ", seq)
+
         # Defensive copy of SamplingParams, which are used by the sampler,
         # this doesn't deep-copy LogitsProcessor objects
         sampling_params = sampling_params.clone()
 
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
-                                  arrival_time, lora_request)
+                                  arrival_time, lora_request, decision)
         
         
         # Add the sequence group to the scheduler.
@@ -542,10 +554,85 @@ class LLMEngine:
         self.scheduler.block_manager.extend_block_tables(seq_group, update_logical_len)
 
         seq_group.activate_seq_group()
-        self.scheduler.mambaback.append(seq_group)
+        self.scheduler.paused_back.append(seq_group)
         # self.scheduler.running.append(seq_group)
+    
+    # NOTE(KJ.W): Add swap in paused requests
+    def swap_in_paused_requests(self, 
+        request_id: str,
+        prompt: Optional[str],
+        sampling_params: SamplingParams,
+        ):
+        max_logprobs = self.get_model_config().max_logprobs
+        if (sampling_params.logprobs
+                and sampling_params.logprobs > max_logprobs) or (
+                    sampling_params.prompt_logprobs
+                    and sampling_params.prompt_logprobs > max_logprobs):
+            raise ValueError(f"Cannot request more than "
+                             f"{max_logprobs} logprobs.")
+        # print("[*] new prompt: ", prompt[-1200:])
+        update_prompt_token_ids = self.encode_request(request_id=request_id, prompt=prompt)
+        # print("[*] new prompt tokens: ", update_prompt_token_ids)
+        seq_group = self.scheduler.get_paused_group(request_id)
+        self.scheduler.paused.remove(seq_group)
+
+        is_swapped = True
         
+        if seq_group in self.scheduler.wait_for_swap_out:
+            self.scheduler.wait_for_swap_out.remove(seq_group)
+            is_swapped = False
         
+        if seq_group not in self.scheduler.api_swapped:
+            is_swapped = False
+
+        seq_group.sampling_params = sampling_params
+        update_logical_len = seq_group.update_seq_group_token_ids(
+            prompt=prompt,
+            token_ids=update_prompt_token_ids,)
+        
+        if is_swapped:
+            self.scheduler.block_manager.extend_block_tables_to_swap_in(seq_group, update_logical_len)
+            self.scheduler.api_swapped.remove(seq_group)
+            seq_group.queue_seq_group()
+            print("[*] swap in from cpu: ", request_id)
+            self.scheduler.swapped.append(seq_group)
+        else:
+            self.scheduler.block_manager.extend_block_tables(seq_group, update_logical_len)
+            seq_group.activate_seq_group()
+            print("[*] swap in from gpu: ", request_id)
+            self.scheduler.paused_back.append(seq_group)
+    
+    # def kill_paused_sequence(self, request_id: str):
+    #     if request_id not in self.paused_sequences:
+    #         return
+    #     paused_seq = self.paused_sequences.pop(request_id)
+    #     self.scheduler.free_seq(paused_seq)
+
+    # NOTE(KJ.W) New function for reactivating or kill the paused sequence
+    def reactivate_sequence(self, 
+        request_id: str,
+        prompt: Optional[str],
+        sampling_params: SamplingParams,
+        ):
+        seq_group = self.scheduler.get_paused_group(request_id)
+        if seq_group is None:
+            return
+        if seq_group.decision is not None:
+            if seq_group.decision == SequenceGroupDecision.SWAPOUT:
+                self.swap_in_paused_requests(request_id, prompt, sampling_params)
+            elif seq_group.decision == SequenceGroupDecision.PRESERVE:
+                self.update_paused_request(request_id, prompt, sampling_params)
+            else:
+                self.remove_paused_seq_group(request_id)
+                self.add_request(request_id, prompt, sampling_params, decision=SequenceGroupDecision.DISCARD)
+        else:
+            if self.use_preserve:
+                self.update_paused_request(request_id, prompt, sampling_params)
+            elif self.use_swap:
+                self.swap_in_paused_requests(request_id, prompt, sampling_params)
+            else:
+                self.add_request(request_id, prompt, sampling_params)        
+    
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a request(s) with the given ID.
 
@@ -826,6 +913,9 @@ class LLMEngine:
 
         # NOTE(KJ.W): Added preserve sequence groups function
         self.scheduler.preserve_paused_seq_groups()
+
+        # NOTE(KJ.W)
+        self.scheduler.swap_out_paused_seq_groups()
         
         # NOTE(KJ.W): pop paused sequence groups from RUNNING queue
         self.scheduler.pop_paused_seq_groups()
@@ -918,16 +1008,27 @@ class LLMEngine:
 
         if not scheduler_outputs.is_empty():
             # Execute the model.
-            all_outputs = self._run_workers(
-                "execute_model",
-                # "overlapped_execute_model",
-                driver_kwargs={
-                    "seq_group_metadata_list": seq_group_metadata_list,
-                    "blocks_to_swap_in": scheduler_outputs.blocks_to_swap_in,
-                    "blocks_to_swap_out": scheduler_outputs.blocks_to_swap_out,
-                    "blocks_to_copy": scheduler_outputs.blocks_to_copy,
-                },
-                use_ray_compiled_dag=USE_RAY_COMPILED_DAG)
+            if not self.use_swap:
+                all_outputs = self._run_workers(
+                    "execute_model",
+                    driver_kwargs={
+                        "seq_group_metadata_list": seq_group_metadata_list,
+                        "blocks_to_swap_in": scheduler_outputs.blocks_to_swap_in,
+                        "blocks_to_swap_out": scheduler_outputs.blocks_to_swap_out,
+                        "blocks_to_copy": scheduler_outputs.blocks_to_copy,
+                    },
+                    use_ray_compiled_dag=USE_RAY_COMPILED_DAG)
+            else:
+                all_outputs = self._run_workers(
+                    "execute_model",
+                    # "overlapped_execute_model",
+                    driver_kwargs={
+                        "seq_group_metadata_list": seq_group_metadata_list,
+                        "blocks_to_swap_in": scheduler_outputs.blocks_to_swap_in,
+                        "blocks_to_swap_out": scheduler_outputs.blocks_to_swap_out,
+                        "blocks_to_copy": scheduler_outputs.blocks_to_copy,
+                    },
+                    use_ray_compiled_dag=USE_RAY_COMPILED_DAG)
             
             # Only the driver worker returns the sampling results.
             output = all_outputs[0]
@@ -1065,8 +1166,8 @@ class LLMEngine:
             if seq.output_text.endswith(stop_str):
                 self._finalize_sequence(seq, sampling_params, stop_str)
                 # seq.status = SequenceStatus.FINISHED_STOPPED
-                if self.use_preserve:
-                    # print(f'PAUSED {seq.seq_id}')
+                if self.use_preserve or self.use_swap:
+                    print(f'[*]PAUSED {seq.seq_id}: str end with stop')
                     seq.status = SequenceStatus.FINISHED_PAUSED
                 else:
                     seq.status = SequenceStatus.FINISHED_STOPPED
@@ -1076,7 +1177,8 @@ class LLMEngine:
                 seq.get_last_token_id())
             self._finalize_sequence(seq, sampling_params, stop_str)
             # seq.status = SequenceStatus.FINISHED_STOPPED
-            if self.use_preserve:
+            if self.use_preserve or self.use_swap:
+                print(f'[*]PAUSED {seq.seq_id}: token end with stop')
                 seq.status = SequenceStatus.FINISHED_PAUSED
             else:
                 seq.status = SequenceStatus.FINISHED_STOPPED
@@ -1096,7 +1198,8 @@ class LLMEngine:
         if ((not sampling_params.ignore_eos) and seq.get_last_token_id()
                 == self.get_tokenizer_for_seq(seq).eos_token_id):
             # seq.status = SequenceStatus.FINISHED_STOPPED
-            if self.use_preserve:
+            if self.use_preserve or self.use_swap:
+                print(f'[*]PAUSED {seq.seq_id}: has EOS token')
                 seq.status = SequenceStatus.FINISHED_PAUSED
             else:
                 seq.status = SequenceStatus.FINISHED_STOPPED
@@ -1223,22 +1326,7 @@ class LLMEngine:
             raise RuntimeError("At least one Worker is dead. "
                                f"Dead Workers: {dead_actors}. ")
     
-    #(KJ.W) New function for reactivating or kill the paused sequence
-    def reactivate_sequence(self, request_id: str, additional_pormpt: str):
-        if request_id not in self.paused_sequences:
-            return
-        paused_seq = self.paused_sequences.pop(request_id)
-        additional_prompt_token_ids = self.encode_request(
-            request_id = request_id,
-            prompt = additional_pormpt,
-            lora_request = paused_seq.lora_request,
-        )
-        paused_seq.prompt_token_ids.extend(additional_prompt_token_ids)
-        paused_seq.status = SequenceStatus.RUNNING
     
-    def kill_paused_sequence(self, request_id: str):
-        if request_id not in self.paused_sequences:
-            return
-        paused_seq = self.paused_sequences.pop(request_id)
-        self.scheduler.free_seq(paused_seq)
+    
+    
         

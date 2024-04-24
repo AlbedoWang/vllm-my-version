@@ -498,7 +498,9 @@ class ModelRunner:
         if self.is_driver_worker:
             # NOTE: We assume that all sequences in the group are all prompts or
             # all decodes.
+            # NOTE(KJ.W): Print seq_group_metadata_list for debugging
             is_prompt = seq_group_metadata_list[0].is_prompt
+
             # Prepare input tensors.
             if is_prompt:
                 (input_tokens, input_positions, input_metadata, prompt_lens,

@@ -19,6 +19,11 @@ class Logprob:
 PromptLogprobs = List[Optional[Dict[int, Logprob]]]
 SampleLogprobs = List[Dict[int, Logprob]]
 
+# NOTE(KJ.W): Add a new enum class for the sequence decision
+class SequenceGroupDecision(enum.Enum):
+    SWAPOUT = enum.auto()
+    PRESERVE = enum.auto()
+    DISCARD = enum.auto()
 
 # NOTE(KJ.W): Add a new status for the paused sequence
 class SequenceStatus(enum.Enum):
@@ -308,6 +313,7 @@ class SequenceGroup:
         sampling_params: SamplingParams,
         arrival_time: float,
         lora_request: Optional[LoRARequest] = None,
+        decision: Optional[SequenceGroupDecision] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
@@ -320,6 +326,10 @@ class SequenceGroup:
         self.lora_request = lora_request
         self.prompt_logprobs: Optional[PromptLogprobs] = None
         self.state = SequenceGroupState()
+
+        # NOTE(KJ.W) Add 2 params for seq group scheduling
+        self.is_paused_back = False
+        self.decision = decision
 
     @property
     def prompt(self) -> str:
@@ -343,6 +353,27 @@ class SequenceGroup:
     
     # NOTE(KJ.W)
     def update_seq_group_token_ids(
+        self, 
+        prompt: str, 
+        token_ids: List[int],
+        ) -> None:
+        id_list = token_ids[len(self.prompt_token_ids)+len(self.output_token_ids)-1:]
+        token_ids_to_append = id_list
+        pre_logical_token_block_len = len(self.get_seqs()[0].logical_token_blocks)
+        for seq in self.get_seqs():
+            seq.prompt = prompt
+            seq.output_text = ""
+            seq.data = SequenceData(token_ids)
+            seq.tokens = None
+            seq.output_logprobs = []
+            seq.extend_token_id(token_ids_to_append)
+        # print("[*]prompt token ids: ", self.prompt_token_ids)
+        after_logical_token_block_len = len(self.get_seqs()[0].logical_token_blocks)
+        extend_logical_token_len = after_logical_token_block_len - pre_logical_token_block_len
+        return extend_logical_token_len
+    
+    # NOTE(KJ.W)
+    def update_seq_group_token_ids_v2(
         self, 
         prompt: str, 
         token_ids: List[int],
@@ -446,6 +477,11 @@ class SequenceGroup:
     def activate_seq_group(self) -> None:
         for seq in self.get_seqs():
             seq.status = SequenceStatus.RUNNING
+
+    # NOTE(KJ.W): Activate all sequences in the PAUSED sequence group to RUNING
+    def queue_seq_group(self) -> None:
+        for seq in self.get_seqs():
+            seq.status = SequenceStatus.SWAPPED
 
     # NOTE(KJ.W): Changed the is_finished function to check if all the sequences are finished or paused
     def is_finished(self) -> bool:

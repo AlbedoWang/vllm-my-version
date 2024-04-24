@@ -9,7 +9,8 @@ from vllm.core.policy import PolicyFactory
 from vllm.lora.request import LoRARequest
 from vllm.logger import init_logger
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
-                           SequenceGroupMetadata, SequenceStatus)
+                           SequenceGroupMetadata, SequenceStatus,
+                           SequenceGroupDecision)
 
 logger = init_logger(__name__)
 
@@ -45,11 +46,20 @@ class SchedulerOutputs:
         self.blocks_to_swap_in = blocks_to_swap_in
         self.blocks_to_swap_out = blocks_to_swap_out
         self.blocks_to_copy = blocks_to_copy
+        
         # Swap in and swap out should never happen at the same time.
-        assert not (blocks_to_swap_in and blocks_to_swap_out)
+        # assert not (blocks_to_swap_in and blocks_to_swap_out)
         self.ignored_seq_groups = ignored_seq_groups
 
         self.num_loras = len(self.lora_requests)
+        if self.num_loras > 0:
+            self._sort_by_lora_ids()
+    
+    def __post_init__(self):
+        # Swap in and swap out should never happen at the same time.
+        assert not (self.blocks_to_swap_in and self.blocks_to_swap_out)
+
+        self.num_loras: int = len(self.lora_requests)
         if self.num_loras > 0:
             self._sort_by_lora_ids()
 
@@ -76,6 +86,7 @@ class Scheduler:
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
         lora_config: Optional[LoRAConfig],
+        use_swap: bool,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -96,6 +107,10 @@ class Scheduler:
             num_cpu_blocks=self.cache_config.num_cpu_blocks,
             sliding_window=self.cache_config.sliding_window,
             enable_caching=self.cache_config.enable_prefix_caching)
+        
+        self.use_swap = use_swap
+        # NOTE(KJ.W): Add Sequence group for waiting swap out
+        self.wait_for_swap_out: Deque[SequenceGroup] = deque()
 
         # Sequence groups in the WAITING state.
         self.waiting: Deque[SequenceGroup] = deque()
@@ -105,8 +120,10 @@ class Scheduler:
         self.swapped: Deque[SequenceGroup] = deque()
         # NOTE(KJ.W): Add Sequence groups in the PAUSED state.
         self.paused: Deque[SequenceGroup] = deque()
-        # NOTE(KJ.W): Add Sequence group for Mamba-Back
-        self.mambaback: Deque[SequenceGroup] = deque()
+        # NOTE(KJ.W): Add Sequence group for Paused-Back
+        self.paused_back: Deque[SequenceGroup] = deque()
+        # NOTE(KJ.W): Add Sequence group for API swapped
+        self.api_swapped: Deque[SequenceGroup] = deque()
 
     @property
     def lora_enabled(self) -> bool:
@@ -114,13 +131,15 @@ class Scheduler:
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the waiting queue.
+        # NOTE(KJ.W): test swap
         self.waiting.append(seq_group)
+        # self.swapped.append(seq_group)
     
     def get_paused_group(self, request_id: str) -> Optional[SequenceGroup]:
         for seq_group in self.paused:
             if seq_group.request_id == request_id:
                 return seq_group
-        logger.warning(f"Sequence group with request ID {request_id} not found in paused sequence groups.")
+        # logger.warning(f"Sequence group with request ID {request_id} not found in paused sequence groups.")
         return None
 
     def abort_seq_group(self, request_id: Union[str, Iterable[str]]) -> None:
@@ -160,7 +179,7 @@ class Scheduler:
                     self.free_seq(seq)
 
     def has_unfinished_seqs(self) -> bool:
-        return self.waiting or self.running or self.swapped or self.mambaback
+        return self.waiting or self.running or self.swapped or self.paused_back # or self.api_swapped
 
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
@@ -262,11 +281,11 @@ class Scheduler:
                 scheduled.append(seq_group)
 
             self.waiting.extendleft(leftover_waiting_sequences)
-
-            while self.mambaback:
-                # If there are sequence groups in the Mamba-Back queue,
+                
+            while self.paused_back:
+                # If there are sequence groups in the Paused-Back queue,
                 # we schedule them first.
-                seq_group = self.mambaback.popleft()
+                seq_group = self.paused_back.popleft()
                 num_new_seqs = seq_group.get_max_num_running_seqs()
                 if (num_curr_seqs + num_new_seqs >
                         self.scheduler_config.max_num_seqs):
@@ -294,6 +313,25 @@ class Scheduler:
         # groups to preempt.
         self.running = self.policy.sort_by_priority(now, self.running)
 
+        # print("[*] current stat: "
+        #         f"\n\t-waiting: {len(self.waiting)}, "
+        #         f"\n\t-running: {len(self.running)}, "
+        #         f"\n\t-swapped: {len(self.swapped)}, "
+        #         f"\n\t-paused: {len(self.paused)}, "
+        #         f"\n\t-paused_back: {len(self.paused_back)}, "
+        #         f"\n\t-wait_for_swap_out: {len(self.wait_for_swap_out)}, "
+        #         f"\n\t-api_swapped: {len(self.api_swapped)}")
+        
+        if self.use_swap:
+            swap_queue = []
+            for seq_group in self.wait_for_swap_out:
+                swap_queue.append(seq_group)
+                print("[*] swap out sequence group with request id: ", seq_group.request_id)
+                self._api_swap_out(seq_group, blocks_to_swap_out)
+            for seq_group in swap_queue:
+                self.wait_for_swap_out.remove(seq_group)
+                self.api_swapped.append(seq_group)
+
         # Reserve new token slots for the running sequence groups.
         running: Deque[SequenceGroup] = deque()
         preempted: List[SequenceGroup] = []
@@ -316,7 +354,6 @@ class Scheduler:
                 self._append_slot(seq_group, blocks_to_copy)
                 running.append(seq_group)
         self.running = running
-
         # Swap in the sequence groups in the SWAPPED state if possible.
         self.swapped = self.policy.sort_by_priority(now, self.swapped)
         if not preempted:
@@ -356,6 +393,7 @@ class Scheduler:
                     curr_loras.add(lora_int_id)
                 self.swapped.popleft()
                 self._swap_in(seq_group, blocks_to_swap_in)
+                # print("[*] swap in seq: ", seq_group.get_seqs()[0])
                 self._append_slot(seq_group, blocks_to_copy)
                 num_curr_seqs += num_new_seqs
                 self.running.append(seq_group)
@@ -455,7 +493,28 @@ class Scheduler:
             for seq in seq_group_to_remove.get_seqs():
                 self.free_seq(seq)
         else:
-            logger.warning(f"Sequence group with request ID {request_id} not found in paused sequence groups.")
+            pass
+            # logger.warning(f"Sequence group with request ID {request_id} not found in paused sequence groups.")
+        
+        seq_group_to_remove = None
+        for seq_group in self.wait_for_swap_out:
+            if seq_group.request_id == request_id:
+                seq_group_to_remove = seq_group
+                break
+        if seq_group_to_remove:
+            self.wait_for_swap_out.remove(seq_group_to_remove)
+            for seq in seq_group_to_remove.get_seqs():
+                self.free_seq(seq)
+        
+        seq_group_to_remove = None
+        for seq_group in self.swapped:
+            if seq_group.request_id == request_id:
+                seq_group_to_remove = seq_group
+                break
+        if seq_group_to_remove:
+            self.swapped.remove(seq_group_to_remove)
+            for seq in seq_group_to_remove.get_seqs():
+                self.free_seq(seq)
 
     def free_finished_seq_groups(self) -> None:
         self.running = deque(seq_group for seq_group in self.running
@@ -556,5 +615,29 @@ class Scheduler:
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             seq.status = SequenceStatus.SWAPPED
 
+    # NOTE(KJ.W): Add API swap out 
+    def _api_swap_out(
+        self,
+        seq_group: SequenceGroup,
+        blocks_to_swap_out: Dict[int, int],
+    ) -> None:
+        if not self.block_manager.can_swap_out(seq_group):
+            # FIXME(woosuk): Abort the sequence group instead of aborting the
+            # entire engine.
+            raise RuntimeError(
+                "Aborted due to the lack of CPU swap space. Please increase "
+                "the swap space to avoid this error.")
+        mapping = self.block_manager.paused_swap_out(seq_group)
+        blocks_to_swap_out.update(mapping)
+        for seq in seq_group.get_seqs(status=SequenceStatus.FINISHED_PAUSED):
+            seq.status = SequenceStatus.SWAPPED
+
+    # NOTE(KJ.W): Add swap out for paused sequence groups
+    def swap_out_paused_seq_groups(self) -> None:
+        for seq_group in self.paused:
+            if seq_group not in self.api_swapped and seq_group not in self.wait_for_swap_out:
+                if not seq_group.decision or seq_group.decision == SequenceGroupDecision.SWAPOUT:
+                    self.wait_for_swap_out.append(seq_group)
+    
     def mark_blocks_as_computed(self, seq_group: SequenceGroup):
         self.block_manager.mark_blocks_as_computed(seq_group)
