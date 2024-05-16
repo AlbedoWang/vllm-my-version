@@ -364,8 +364,12 @@ class Scheduler:
                 for seq_group in self.running) if self.lora_enabled else None
 
             leftover_swapped = deque()
+            
+            # NOTE(KJ.W): Add a flag to check if there is any sequence group swapped back.
+            swapped_back = False
 
             while self.swapped:
+                swapped_back = True
                 seq_group = self.swapped[0]
                 lora_int_id = 0
                 if self.lora_enabled:
@@ -409,7 +413,7 @@ class Scheduler:
 
         scheduler_outputs = SchedulerOutputs(
             scheduled_seq_groups=self.running,
-            prompt_run=False,
+            prompt_run=swapped_back, # False
             num_batched_tokens=num_batched_tokens,
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,

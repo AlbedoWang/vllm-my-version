@@ -533,9 +533,10 @@ class BlockSpaceManager:
 
     def get_common_computed_block_ids(self,
                                       seq_group: SequenceGroup) -> List[int]:
-        # Can return non-empty result only with prefix caching enabled.
-        if not self.enable_caching:
-            return []
+        # NOTE(KJ.W): Remove conditional statement
+        # # Can return non-empty result only with prefix caching enabled.
+        # if not self.enable_caching:
+        #     return []
 
         ids_list = [
             self.get_all_block_ids_till_computed(seq)
@@ -544,8 +545,12 @@ class BlockSpaceManager:
         return commonprefix([ids for ids in ids_list if ids != []])
 
     def mark_blocks_as_computed(self, seq_group: SequenceGroup):
-        # NOTE: We only mark the last full block because with prefix caching,
-        # all blocks until the marked one are guaranteed to be computed.
-        if self.enable_caching:
-            for seq in seq_group.seqs_dict.values():
-                self.compute_last_full_block_in_seq(seq)
+        # # NOTE: We only mark the last full block because with prefix caching,
+        # # all blocks until the marked one are guaranteed to be computed.
+        # if self.enable_caching:
+        #     for seq in seq_group.seqs_dict.values():
+        #         self.compute_last_full_block_in_seq(seq)
+
+        # NOTE(KJ.W): Remove conditional statement
+        for seq in seq_group.seqs_dict.values():
+            self.compute_last_full_block_in_seq(seq)

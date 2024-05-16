@@ -904,7 +904,9 @@ class LLMEngine:
 
         # If prefix caching is enabled, mark all blocks in the sequence groups
         # as completed so that future requests don't attempt to recompute them
-        if self.cache_config.enable_prefix_caching:
+        
+        # NOTE(KJ.W): Added the condition to check if the prefix caching is enabled
+        if self.cache_config.enable_prefix_caching or self.use_swap or self.use_preserve:
             for seq_group in scheduled_seq_groups:
                 self.scheduler.mark_blocks_as_computed(seq_group)
 
@@ -1020,8 +1022,8 @@ class LLMEngine:
                     use_ray_compiled_dag=USE_RAY_COMPILED_DAG)
             else:
                 all_outputs = self._run_workers(
-                    "execute_model",
-                    # "overlapped_execute_model",
+                    # "execute_model",
+                    "overlapped_execute_model",
                     driver_kwargs={
                         "seq_group_metadata_list": seq_group_metadata_list,
                         "blocks_to_swap_in": scheduler_outputs.blocks_to_swap_in,
